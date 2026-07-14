@@ -20,6 +20,21 @@ android {
         }
     }
 
+    // 多个 Matter jar 内都带有 META-INF/*.kotlin_module 等元数据，
+    // 合并时会因「同路径多文件」冲突导致打包失败，这里统一排除。
+    packaging {
+        resources {
+            excludes += setOf(
+                "META-INF/*.kotlin_module",
+                "META-INF/versions/**",
+                "META-INF/LICENSE*",
+                "META-INF/NOTICE*",
+                "META-INF/DEPENDENCIES",
+                "META-INF/*.version",
+            )
+        }
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
