@@ -15,13 +15,9 @@ dependencies:
   flutter:
     sdk: flutter
 
-  # The following adds the Cupertino Icons font to your application.
-  # Use with the CupertinoIcons class for iOS style icons.
-  cupertino_icons: ^1.0.8
-
   # 插件平台接口与 Matter 配网/控制所需的运行时依赖。
+  # 注意：本插件不含任何 UI，扫码/图标等界面依赖由主 App 自行引入。
   plugin_platform_interface: ^2.1.8
-  mobile_scanner: ^5.2.3
   permission_handler: ^11.3.1
 
 dev_dependencies:
