@@ -42,6 +42,12 @@ abstract class MatterBackend {
   /// 设置亮度（0-100）。返回更新后的设备。
   Future<MatterDevice> setBrightness(String deviceId, int brightness);
 
+  /// 设置彩光颜色。[hue] 0-360 度，[saturation] 0-100。返回更新后的设备。
+  Future<MatterDevice> setColor(String deviceId, int hue, int saturation);
+
+  /// 设置色温（暖冷光）。[mireds] 为 Matter mireds 值（约 154 冷 .. 500 暖）。
+  Future<MatterDevice> setColorTemperature(String deviceId, int mireds);
+
   /// 解绑（移除）一个设备。
   Future<void> removeDevice(String deviceId);
 

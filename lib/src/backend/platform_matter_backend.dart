@@ -66,6 +66,29 @@ class PlatformMatterBackend implements MatterBackend {
   }
 
   @override
+  Future<MatterDevice> setColor(
+    String deviceId,
+    int hue,
+    int saturation,
+  ) async {
+    final result = await _invoke('setColor', {
+      'deviceId': deviceId,
+      'hue': hue,
+      'saturation': saturation,
+    });
+    return MatterDevice.fromMap(_asMap(result));
+  }
+
+  @override
+  Future<MatterDevice> setColorTemperature(String deviceId, int mireds) async {
+    final result = await _invoke('setColorTemperature', {
+      'deviceId': deviceId,
+      'mireds': mireds,
+    });
+    return MatterDevice.fromMap(_asMap(result));
+  }
+
+  @override
   Future<void> removeDevice(String deviceId) async {
     await _invoke('removeDevice', {'deviceId': deviceId});
   }

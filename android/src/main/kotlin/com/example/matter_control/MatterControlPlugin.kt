@@ -1,6 +1,7 @@
 package com.example.matter_control
 
 import android.content.Context
+import android.content.SharedPreferences
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -25,6 +26,8 @@ import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.plugin.common.MethodChannel.MethodCallHandler
+import org.json.JSONArray
+import org.json.JSONObject
 import io.flutter.plugin.common.MethodChannel.Result
 
 /**
@@ -41,9 +44,14 @@ class MatterControlPlugin : FlutterPlugin, MethodCallHandler {
     private lateinit var channel: MethodChannel
     private var appContext: Context? = null
 
-    // 内存中的假设备表：key = deviceId
+    // 内存中的设备表：key = deviceId。启动时从 SharedPreferences 恢复，
+    // 每次增删改后落盘，保证 App / 进程重启后设备列表不丢（Matter 底层的
+    // Fabric 凭据本就是持久化的，这里补齐上层设备元数据的持久化）。
     private val devices = LinkedHashMap<String, HashMap<String, Any?>>()
     private var counter = 0
+
+    // 设备表持久化存储。
+    private var prefs: SharedPreferences? = null
 
     // AndroidChipPlatform 只需初始化一次，持有引用避免被 GC 回收。
     private var chipPlatform: AndroidChipPlatform? = null
@@ -55,6 +63,9 @@ class MatterControlPlugin : FlutterPlugin, MethodCallHandler {
 
     override fun onAttachedToEngine(@NonNull binding: FlutterPlugin.FlutterPluginBinding) {
         appContext = binding.applicationContext
+        prefs = binding.applicationContext
+            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        loadDevices()
         channel = MethodChannel(binding.binaryMessenger, CHANNEL_NAME)
         channel.setMethodCallHandler(this)
     }
@@ -71,6 +82,8 @@ class MatterControlPlugin : FlutterPlugin, MethodCallHandler {
             "getDevices" -> result.success(devices.values.toList())
             "setOnOff" -> setOnOff(call, result)
             "setBrightness" -> setBrightness(call, result)
+            "setColor" -> setColor(call, result)
+            "setColorTemperature" -> setColorTemperature(call, result)
             "removeDevice" -> removeDevice(call, result)
             else -> result.notImplemented()
         }
@@ -153,11 +166,44 @@ class MatterControlPlugin : FlutterPlugin, MethodCallHandler {
             ControllerParams.newBuilder()
                 .setControllerVendorId(TEST_VENDOR_ID)
                 .setEnableServerInteractions(true)
+                // 设为中国：放开 2.4G 信道 12/13，避免灯按默认监管域扫不到
+                // 工作在这些信道的 AP，导致 ConnectNetwork 超时 networkingStatus=12。
+                .setCountryCode("CN")
+                // 先扫描 WiFi 再连接：部分固件需要 ScanNetworks 缓存目标 AP
+                // 后 ConnectNetwork 才成功（原流程日志显示 skipping ScanNetworks）。
+                .setAttemptNetworkScanWiFi(true)
                 .build()
         )
         controller.setAttestationTrustStoreDelegate(
             ExampleAttestationTrustStoreDelegate(controller)
         )
+        // 开发模式：注册设备认证委托。当设备 DAC/PAA 校验失败（如非标准
+        // 测试 VID 的开发样品，errorCode!=0）时，放行继续配网。
+        // TODO(上架前): 移除此放行逻辑，改为提供设备厂商真实 PAA 根证书，
+        //   让 AttestationVerification 真正通过。
+        controller.setDeviceAttestationDelegate(0) { devicePtr, _, errorCode ->
+            if (errorCode == 0) {
+                Log.i(FLOW_TAG, "[COMMISSION] 设备认证通过，继续配网")
+            } else {
+                Log.w(
+                    FLOW_TAG,
+                    "[COMMISSION] 设备认证失败 errorCode=$errorCode，开发模式放行继续配网（上架前需修正）"
+                )
+            }
+            // ignoreAttestationFailure=true：忽略认证失败继续。
+            // 必须异步调用：continueCommissioning 会往 CHIP 工作线程派发任务，
+            // 若直接在本回调（同为 CHIP 线程）同步调，会自己等自己造成死锁，
+            // 表现为调用后既不返回也不抛异常、配网永久卡死。
+            Thread {
+                try {
+                    Log.i(FLOW_TAG, "[COMMISSION] 调用 continueCommissioning devicePtr=$devicePtr")
+                    controller.continueCommissioning(devicePtr, true)
+                    Log.i(FLOW_TAG, "[COMMISSION] continueCommissioning 调用返回")
+                } catch (t: Throwable) {
+                    Log.e(FLOW_TAG, "[COMMISSION] continueCommissioning 抛异常", t)
+                }
+            }.start()
+        }
         chipDeviceController = controller
         Log.i(TAG, "ensureController: ChipDeviceController 创建完成")
         return controller
@@ -199,6 +245,11 @@ class MatterControlPlugin : FlutterPlugin, MethodCallHandler {
                 } else {
                     null
                 }
+            Log.i(
+                FLOW_TAG,
+                "[COMMISSION] WiFi 凭据组装: network=${if (network == null) "null(将跳过WiFi配置!)" else "OK"} " +
+                    "ssid='${wifiSsid ?: ""}' pwdLen=${wifiPassword?.length ?: 0}"
+            )
 
             val deviceId = nextDeviceId()
             val bleManager = MatterBluetoothManager(platform)
@@ -214,6 +265,8 @@ class MatterControlPlugin : FlutterPlugin, MethodCallHandler {
                         safeResult.success(device)
                     } else {
                         Log.e(TAG, "配网失败 errorCode=$errorCode")
+                        // 失败时释放 BLE，避免下次报 "BLE already in use"。
+                        bleManager.cleanup()
                         safeResult.error(
                             "commissioning_failed",
                             "配网失败，错误码=$errorCode",
@@ -224,6 +277,7 @@ class MatterControlPlugin : FlutterPlugin, MethodCallHandler {
 
                 override fun onError(error: Throwable) {
                     Log.e(TAG, "配网过程出错", error)
+                    bleManager.cleanup()
                     safeResult.error("commissioning_error", error.message ?: "配网异常", null)
                 }
             })
@@ -240,6 +294,7 @@ class MatterControlPlugin : FlutterPlugin, MethodCallHandler {
                 }
                 bleManager.connect(context, device) { gatt ->
                     if (gatt == null) {
+                        bleManager.cleanup()
                         safeResult.error("ble_connect_failed", "BLE 连接失败", null)
                         return@connect
                     }
@@ -254,6 +309,7 @@ class MatterControlPlugin : FlutterPlugin, MethodCallHandler {
                         )
                     } catch (t: Throwable) {
                         Log.e(TAG, "pairDevice 调用异常", t)
+                        bleManager.cleanup()
                         safeResult.error("pair_device_error", t.message ?: "pairDevice 异常", null)
                     }
                 }
@@ -363,16 +419,20 @@ class MatterControlPlugin : FlutterPlugin, MethodCallHandler {
         val device = hashMapOf<String, Any?>(
             "id" to id,
             "name" to "Matter 设备 $deviceId",
-            "type" to "dimmable_light",
+            "type" to "color_light",
             "online" to true,
             // 记录 Matter nodeId，控制命令据此取回设备指针（不回传给 Flutter）。
             "_nodeId" to nodeId,
             "state" to hashMapOf<String, Any?>(
                 "on" to false,
-                "brightness" to 80
+                "brightness" to 80,
+                "hue" to 0,
+                "saturation" to 0,
+                "colorTempMireds" to 250
             )
         )
         devices[id] = device
+        saveDevices()
         return device
     }
 
@@ -403,6 +463,7 @@ class MatterControlPlugin : FlutterPlugin, MethodCallHandler {
                     @Suppress("UNCHECKED_CAST")
                     val state = device["state"] as HashMap<String, Any?>
                     state["on"] = on
+                    saveDevices()
                     safeResult.success(device)
                 }
 
@@ -440,6 +501,7 @@ class MatterControlPlugin : FlutterPlugin, MethodCallHandler {
                     val state = device["state"] as HashMap<String, Any?>
                     state["brightness"] = brightness
                     state["on"] = brightness > 0
+                    saveDevices()
                     safeResult.success(device)
                 }
 
@@ -450,6 +512,91 @@ class MatterControlPlugin : FlutterPlugin, MethodCallHandler {
             }
             // moveToLevel(callback, level, transitionTime, optionsMask, optionsOverride)
             cluster.moveToLevel(cb, level, 0, 0, 0)
+        }
+    }
+
+    /**
+     * 设置彩光颜色。入参 hue(0..360 度) + saturation(0..100 百分比)，
+     * 换算成 Matter ColorControl 的 hue(0..254) + saturation(0..254)。
+     */
+    private fun setColor(call: MethodCall, result: Result) {
+        val id = call.argument<String>("deviceId")
+        val hueDeg = (call.argument<Int>("hue") ?: 0).coerceIn(0, 360)
+        val satPct = (call.argument<Int>("saturation") ?: 0).coerceIn(0, 100)
+        val device = devices[id]
+        if (device == null) {
+            result.error("device_not_found", "找不到设备: $id", null)
+            return
+        }
+        val nodeId = (device["_nodeId"] as? Long)
+        if (nodeId == null) {
+            result.error("no_node_id", "设备缺少 nodeId，无法控制", null)
+            return
+        }
+        val safeResult = SafeResult(result, mainHandler)
+        // 度→0..254，百分比→0..254。
+        val hue = (hueDeg * 254 / 360).coerceIn(0, 254)
+        val saturation = (satPct * 254 / 100).coerceIn(0, 254)
+
+        withConnectedDevice(nodeId, safeResult) { devicePtr ->
+            val cluster = ChipClusters.ColorControlCluster(devicePtr, DEFAULT_ENDPOINT)
+            val cb = object : ChipClusters.DefaultClusterCallback {
+                override fun onSuccess() {
+                    @Suppress("UNCHECKED_CAST")
+                    val state = device["state"] as HashMap<String, Any?>
+                    state["hue"] = hueDeg
+                    state["saturation"] = satPct
+                    saveDevices()
+                    safeResult.success(device)
+                }
+
+                override fun onError(error: Exception) {
+                    Log.e(TAG, "setColor 失败", error)
+                    safeResult.error("color_failed", error.message ?: "ColorControl 命令失败", null)
+                }
+            }
+            // moveToHueAndSaturation(cb, hue, saturation, transitionTime, optionsMask, optionsOverride)
+            cluster.moveToHueAndSaturation(cb, hue, saturation, 0, 0, 0)
+        }
+    }
+
+    /**
+     * 设置色温（暖冷光）。入参 mireds（Matter 的 ColorTemperatureMireds，
+     * 常见范围约 154(冷/6500K) .. 500(暖/2000K)）。
+     */
+    private fun setColorTemperature(call: MethodCall, result: Result) {
+        val id = call.argument<String>("deviceId")
+        val mireds = (call.argument<Int>("mireds") ?: 250).coerceIn(1, 65279)
+        val device = devices[id]
+        if (device == null) {
+            result.error("device_not_found", "找不到设备: $id", null)
+            return
+        }
+        val nodeId = (device["_nodeId"] as? Long)
+        if (nodeId == null) {
+            result.error("no_node_id", "设备缺少 nodeId，无法控制", null)
+            return
+        }
+        val safeResult = SafeResult(result, mainHandler)
+
+        withConnectedDevice(nodeId, safeResult) { devicePtr ->
+            val cluster = ChipClusters.ColorControlCluster(devicePtr, DEFAULT_ENDPOINT)
+            val cb = object : ChipClusters.DefaultClusterCallback {
+                override fun onSuccess() {
+                    @Suppress("UNCHECKED_CAST")
+                    val state = device["state"] as HashMap<String, Any?>
+                    state["colorTempMireds"] = mireds
+                    saveDevices()
+                    safeResult.success(device)
+                }
+
+                override fun onError(error: Exception) {
+                    Log.e(TAG, "setColorTemperature 失败", error)
+                    safeResult.error("color_temp_failed", error.message ?: "ColorControl 色温命令失败", null)
+                }
+            }
+            // moveToColorTemperature(cb, mireds, transitionTime, optionsMask, optionsOverride)
+            cluster.moveToColorTemperature(cb, mireds, 0, 0, 0)
         }
     }
 
@@ -466,6 +613,7 @@ class MatterControlPlugin : FlutterPlugin, MethodCallHandler {
 
         if (nodeId == null) {
             devices.remove(id)
+            saveDevices()
             safeResult.success(null)
             return
         }
@@ -476,6 +624,7 @@ class MatterControlPlugin : FlutterPlugin, MethodCallHandler {
                 override fun onSuccess(nodeId: Long) {
                     Log.i(TAG, "unpair 成功 nodeId=$nodeId")
                     devices.remove(id)
+                    saveDevices()
                     safeResult.success(null)
                 }
 
@@ -483,12 +632,14 @@ class MatterControlPlugin : FlutterPlugin, MethodCallHandler {
                     Log.e(TAG, "unpair 失败 errorCode=$errorCode")
                     // 即使 native 端失败，本地也移除，避免残留。
                     devices.remove(id)
+                    saveDevices()
                     safeResult.success(null)
                 }
             })
         } catch (t: Throwable) {
             Log.e(TAG, "removeDevice 异常", t)
             devices.remove(id)
+            saveDevices()
             safeResult.success(null)
         }
     }
@@ -534,9 +685,100 @@ class MatterControlPlugin : FlutterPlugin, MethodCallHandler {
         }
     }
 
+    // ---------------------------------------------------------------------
+    // 设备表持久化：把内存中的 devices 序列化为 JSON 存进 SharedPreferences，
+    // App / 进程重启后从中恢复。Matter 底层 Fabric 凭据本身已持久化，这里只是
+    // 补齐上层设备元数据（名称、类型、状态、nodeId），让重启后仍能列出并控制。
+    // ---------------------------------------------------------------------
+
+    /** 把当前 devices 表写入持久化存储。 */
+    private fun saveDevices() {
+        val store = prefs ?: return
+        try {
+            val arr = JSONArray()
+            for (device in devices.values) {
+                arr.put(deviceToJson(device))
+            }
+            store.edit()
+                .putString(KEY_DEVICES, arr.toString())
+                .putInt(KEY_COUNTER, counter)
+                .apply()
+        } catch (t: Throwable) {
+            Log.e(TAG, "saveDevices 失败", t)
+        }
+    }
+
+    /** 从持久化存储恢复 devices 表（在 onAttachedToEngine 中调用）。 */
+    private fun loadDevices() {
+        val store = prefs ?: return
+        try {
+            counter = store.getInt(KEY_COUNTER, 0)
+            val raw = store.getString(KEY_DEVICES, null) ?: return
+            val arr = JSONArray(raw)
+            devices.clear()
+            for (i in 0 until arr.length()) {
+                val device = jsonToDevice(arr.getJSONObject(i))
+                val id = device["id"] as? String ?: continue
+                devices[id] = device
+            }
+            Log.i(TAG, "loadDevices: 恢复 ${devices.size} 个设备")
+        } catch (t: Throwable) {
+            Log.e(TAG, "loadDevices 失败，忽略已存数据", t)
+        }
+    }
+
+    /** 单个设备 map -> JSON。_nodeId 用字符串存，避免 JSON 精度丢失。 */
+    private fun deviceToJson(device: HashMap<String, Any?>): JSONObject {
+        @Suppress("UNCHECKED_CAST")
+        val state = device["state"] as? HashMap<String, Any?> ?: hashMapOf()
+        val stateJson = JSONObject()
+            .put("on", state["on"] as? Boolean ?: false)
+            .put("brightness", (state["brightness"] as? Number)?.toInt() ?: 100)
+            .put("hue", (state["hue"] as? Number)?.toInt() ?: 0)
+            .put("saturation", (state["saturation"] as? Number)?.toInt() ?: 0)
+            .put(
+                "colorTempMireds",
+                (state["colorTempMireds"] as? Number)?.toInt() ?: 250
+            )
+        return JSONObject()
+            .put("id", device["id"] as? String)
+            .put("name", device["name"] as? String)
+            .put("type", device["type"] as? String)
+            .put("online", device["online"] as? Boolean ?: true)
+            .put("_nodeId", (device["_nodeId"] as? Long)?.toString())
+            .put("state", stateJson)
+    }
+
+    /** JSON -> 单个设备 map，与 buildDevice 产出的结构保持一致。 */
+    private fun jsonToDevice(json: JSONObject): HashMap<String, Any?> {
+        val stateJson = json.optJSONObject("state") ?: JSONObject()
+        val state = hashMapOf<String, Any?>(
+            "on" to stateJson.optBoolean("on", false),
+            "brightness" to stateJson.optInt("brightness", 100),
+            "hue" to stateJson.optInt("hue", 0),
+            "saturation" to stateJson.optInt("saturation", 0),
+            "colorTempMireds" to stateJson.optInt("colorTempMireds", 250)
+        )
+        // 恢复时设为离线，控制命令首次访问会触发 CASE 会话重新拉起。
+        return hashMapOf(
+            "id" to json.optString("id"),
+            "name" to json.optString("name"),
+            "type" to json.optString("type"),
+            "online" to true,
+            "_nodeId" to json.optString("_nodeId", "").toLongOrNull(),
+            "state" to state
+        )
+    }
+
     companion object {
         private const val CHANNEL_NAME = "matter_control/methods"
         private const val TAG = "MatterControlPlugin"
+        /** 统一日志标头，logcat 用 `grep MATTER_FLOW` 只看配网关键流程。 */
+        private const val FLOW_TAG = "MATTER_FLOW"
+        // 设备表持久化：SharedPreferences 文件名与键。
+        private const val PREFS_NAME = "matter_control_devices"
+        private const val KEY_DEVICES = "devices_json"
+        private const val KEY_COUNTER = "device_counter"
         // 0xFFF4 为测试用 Vendor ID，正式量产需替换为分配到的公司 ID
         private const val TEST_VENDOR_ID = 0xFFF4
         // BLE 扫描超时（毫秒）
@@ -604,25 +846,55 @@ private class SafeResult(
  */
 private open class BaseCompletionListener :
     ChipDeviceController.CompletionListener {
-    override fun onConnectDeviceComplete() {}
-    override fun onStatusUpdate(status: Int) {}
-    override fun onPairingComplete(errorCode: Int) {}
-    override fun onPairingDeleted(errorCode: Int) {}
-    override fun onCommissioningComplete(nodeId: Long, errorCode: Int) {}
+    override fun onConnectDeviceComplete() {
+        Log.i(FLOW, "[COMMISSION] onConnectDeviceComplete")
+    }
+    override fun onStatusUpdate(status: Int) {
+        Log.i(FLOW, "[COMMISSION] onStatusUpdate status=$status")
+    }
+    override fun onPairingComplete(errorCode: Int) {
+        Log.i(FLOW, "[COMMISSION] onPairingComplete(PASE) errorCode=$errorCode ${if (errorCode == 0) "(OK)" else "(FAILED)"}")
+    }
+    override fun onPairingDeleted(errorCode: Int) {
+        Log.i(FLOW, "[COMMISSION] onPairingDeleted errorCode=$errorCode")
+    }
+    override fun onCommissioningComplete(nodeId: Long, errorCode: Int) {
+        Log.i(FLOW, "[COMMISSION] onCommissioningComplete nodeId=$nodeId errorCode=$errorCode ${if (errorCode == 0) "(OK)" else "(FAILED)"}")
+    }
     override fun onReadCommissioningInfo(
         vendorId: Int,
         productId: Int,
         wifiEndpointId: Int,
         threadEndpointId: Int
-    ) {}
-    override fun onCommissioningStatusUpdate(nodeId: Long, stage: String?, errorCode: Int) {}
-    override fun onNotifyChipConnectionClosed() {}
-    override fun onCloseBleComplete() {}
-    override fun onError(error: Throwable) {}
-    override fun onOpCSRGenerationComplete(csr: ByteArray?) {}
-    override fun onICDRegistrationInfoRequired() {}
+    ) {
+        Log.i(FLOW, "[COMMISSION] onReadCommissioningInfo vendorId=$vendorId productId=$productId wifiEp=$wifiEndpointId threadEp=$threadEndpointId")
+    }
+    override fun onCommissioningStatusUpdate(nodeId: Long, stage: String?, errorCode: Int) {
+        Log.i(FLOW, "[COMMISSION] 阶段=$stage errorCode=$errorCode ${if (errorCode == 0) "(OK)" else "(FAILED)"} nodeId=$nodeId")
+    }
+    override fun onNotifyChipConnectionClosed() {
+        Log.i(FLOW, "[COMMISSION] onNotifyChipConnectionClosed")
+    }
+    override fun onCloseBleComplete() {
+        Log.i(FLOW, "[COMMISSION] onCloseBleComplete")
+    }
+    override fun onError(error: Throwable) {
+        Log.e(FLOW, "[COMMISSION] onError: ${error.message}", error)
+    }
+    override fun onOpCSRGenerationComplete(csr: ByteArray?) {
+        Log.i(FLOW, "[COMMISSION] onOpCSRGenerationComplete csrLen=${csr?.size ?: 0}")
+    }
+    override fun onICDRegistrationInfoRequired() {
+        Log.i(FLOW, "[COMMISSION] onICDRegistrationInfoRequired")
+    }
     override fun onICDRegistrationComplete(
         errorCode: Int,
         icdDeviceInfo: chip.devicecontroller.ICDDeviceInfo?
-    ) {}
+    ) {
+        Log.i(FLOW, "[COMMISSION] onICDRegistrationComplete errorCode=$errorCode")
+    }
+
+    private companion object {
+        const val FLOW = "MATTER_FLOW"
+    }
 }

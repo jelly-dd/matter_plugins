@@ -91,6 +91,24 @@ class MatterControl {
     return device;
   }
 
+  /// 设置彩光颜色。[hue] 0-360 度，[saturation] 0-100。
+  Future<MatterDevice> setColor(
+    String deviceId,
+    int hue,
+    int saturation,
+  ) async {
+    final device = await _backend.setColor(deviceId, hue, saturation);
+    _replaceInCache(device);
+    return device;
+  }
+
+  /// 设置色温（暖冷光）。[mireds] 为 Matter mireds 值（约 154 冷 .. 500 暖）。
+  Future<MatterDevice> setColorTemperature(String deviceId, int mireds) async {
+    final device = await _backend.setColorTemperature(deviceId, mireds);
+    _replaceInCache(device);
+    return device;
+  }
+
   /// 解绑设备。
   Future<void> removeDevice(String deviceId) async {
     await _backend.removeDevice(deviceId);

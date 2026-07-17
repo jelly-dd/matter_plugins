@@ -96,6 +96,33 @@ class FakeMatterBackend implements MatterBackend {
   }
 
   @override
+  Future<MatterDevice> setColor(
+    String deviceId,
+    int hue,
+    int saturation,
+  ) async {
+    await Future.delayed(const Duration(milliseconds: 300));
+    final h = hue.clamp(0, 360);
+    final s = saturation.clamp(0, 100);
+    return _update(
+      deviceId,
+      (d) => d.copyWith(
+        state: d.state.copyWith(hue: h, saturation: s),
+      ),
+    );
+  }
+
+  @override
+  Future<MatterDevice> setColorTemperature(String deviceId, int mireds) async {
+    await Future.delayed(const Duration(milliseconds: 300));
+    final m = mireds.clamp(1, 65279);
+    return _update(
+      deviceId,
+      (d) => d.copyWith(state: d.state.copyWith(colorTempMireds: m)),
+    );
+  }
+
+  @override
   Future<void> removeDevice(String deviceId) async {
     await Future.delayed(const Duration(milliseconds: 200));
     _devices.removeWhere((d) => d.id == deviceId);

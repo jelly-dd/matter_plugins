@@ -145,27 +145,32 @@ class MatterBluetoothManager(
 
             override fun onConnectionStateChange(gatt: BluetoothGatt?, status: Int, newState: Int) {
                 super.onConnectionStateChange(gatt, status, newState)
-                Log.i(TAG, "onConnectionStateChange status=$status newState=$newState")
+                Log.i(FLOW, "[GATT] onConnectionStateChange status=$status newState=$newState")
                 wrapped.onConnectionStateChange(gatt, status, newState)
                 if (newState == BluetoothProfile.STATE_CONNECTED &&
                     status == BluetoothGatt.GATT_SUCCESS
                 ) {
-                    Log.i(TAG, "已连接，开始发现服务")
+                    Log.i(FLOW, "[GATT] 已连接，开始发现服务 discoverServices()")
                     gatt?.discoverServices()
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                    Log.w(FLOW, "[GATT] 连接断开 status=$status（配网中途断开通常意味着上一步失败）")
+                    // 断开时必须释放 GATT client，否则句柄泄漏，
+                    // 下次连同一设备会报 "BLE already in use" 并被 status=8 踢掉。
+                    cleanup()
                     finishOnce(null)
                 }
             }
 
             override fun onServicesDiscovered(gatt: BluetoothGatt?, status: Int) {
-                Log.d(TAG, "onServicesDiscovered status=$status")
+                Log.i(FLOW, "[GATT] onServicesDiscovered status=$status ${gattStatus(status)}")
                 wrapped.onServicesDiscovered(gatt, status)
+                Log.i(FLOW, "[GATT] 发起 requestMtu(247)")
                 gatt?.requestMtu(247)
             }
 
             override fun onMtuChanged(gatt: BluetoothGatt?, mtu: Int, status: Int) {
                 super.onMtuChanged(gatt, mtu, status)
-                Log.d(TAG, "onMtuChanged mtu=$mtu status=$status")
+                Log.i(FLOW, "[GATT] onMtuChanged mtu=$mtu status=$status ${gattStatus(status)} -> 判定 GATT 就绪")
                 wrapped.onMtuChanged(gatt, mtu, status)
                 finishOnce(gatt)
             }
@@ -174,6 +179,7 @@ class MatterBluetoothManager(
                 gatt: BluetoothGatt,
                 characteristic: BluetoothGattCharacteristic
             ) {
+                Log.d(FLOW, "[GATT] onCharacteristicChanged uuid=${characteristic.uuid}")
                 wrapped.onCharacteristicChanged(gatt, characteristic)
             }
 
@@ -182,6 +188,7 @@ class MatterBluetoothManager(
                 characteristic: BluetoothGattCharacteristic,
                 status: Int
             ) {
+                Log.d(FLOW, "[GATT] onCharacteristicRead uuid=${characteristic.uuid} status=$status ${gattStatus(status)}")
                 wrapped.onCharacteristicRead(gatt, characteristic, status)
             }
 
@@ -190,6 +197,7 @@ class MatterBluetoothManager(
                 characteristic: BluetoothGattCharacteristic,
                 status: Int
             ) {
+                Log.i(FLOW, "[GATT] onCharacteristicWrite uuid=${characteristic.uuid} status=$status ${gattStatus(status)}")
                 wrapped.onCharacteristicWrite(gatt, characteristic, status)
             }
 
@@ -198,6 +206,7 @@ class MatterBluetoothManager(
                 descriptor: BluetoothGattDescriptor,
                 status: Int
             ) {
+                Log.d(FLOW, "[GATT] onDescriptorRead uuid=${descriptor.uuid} status=$status ${gattStatus(status)}")
                 wrapped.onDescriptorRead(gatt, descriptor, status)
             }
 
@@ -206,6 +215,14 @@ class MatterBluetoothManager(
                 descriptor: BluetoothGattDescriptor,
                 status: Int
             ) {
+                // 这一步是 BTP 订阅 CHIP 特征通知（写 CCCD）。status!=0 即订阅失败，
+                // 是 0xAC Internal error 的高度可疑点。
+                Log.i(
+                    FLOW,
+                    "[GATT] onDescriptorWrite descUuid=${descriptor.uuid} " +
+                        "charUuid=${descriptor.characteristic?.uuid} " +
+                        "status=$status ${gattStatus(status)}"
+                )
                 wrapped.onDescriptorWrite(gatt, descriptor, status)
             }
 
@@ -218,9 +235,10 @@ class MatterBluetoothManager(
             }
         }
 
-        Log.i(TAG, "开始 GATT 连接")
+        Log.i(FLOW, "[GATT] 开始 GATT 连接 device=${device.address}")
         bleGatt = device.connectGatt(context, false, gattCallback)
         connectionId = chipPlatform.bleManager.addConnection(bleGatt)
+        Log.i(FLOW, "[GATT] addConnection -> connectionId=$connectionId")
         chipPlatform.bleManager.setBleCallback(this)
     }
 
@@ -230,13 +248,47 @@ class MatterBluetoothManager(
     }
 
     override fun onNotifyChipConnectionClosed(connId: Int) {
-        bleGatt?.close()
+        Log.d(FLOW, "[GATT] onNotifyChipConnectionClosed connId=$connId")
+        cleanup()
+    }
+
+    /**
+     * 释放本次配网持有的 BLE 资源。可重复调用（幂等）。
+     *
+     * 必须在所有终止路径调用：连接断开、配网失败、配网成功后。
+     * 否则 [BluetoothGatt] client 句柄泄漏，累积到系统上限后再连同一设备
+     * 会报 "BLE already in use"，MTU 就绪后立即被 status=8(GATT_CONN_TIMEOUT) 踢掉。
+     */
+    fun cleanup() {
+        val gatt = bleGatt ?: run {
+            if (connectionId != 0) {
+                chipPlatform.bleManager.removeConnection(connectionId)
+                connectionId = 0
+            }
+            return
+        }
+        Log.i(FLOW, "[GATT] cleanup: 关闭 GATT 并移除 connection=$connectionId")
+        try {
+            gatt.disconnect()
+            gatt.close()
+        } catch (t: Throwable) {
+            Log.w(FLOW, "[GATT] cleanup 关闭异常: ${t.message}")
+        }
+        if (connectionId != 0) {
+            chipPlatform.bleManager.removeConnection(connectionId)
+        }
+        bleGatt = null
         connectionId = 0
-        Log.d(TAG, "onNotifyChipConnectionClosed")
     }
 
     companion object {
         private const val TAG = "MatterBluetoothManager"
+        /** 统一日志标头，logcat 用 `grep MATTER_FLOW` 即可只看配网关键流程。 */
+        private const val FLOW = "MATTER_FLOW"
         private const val CHIP_UUID = "0000FFF6-0000-1000-8000-00805F9B34FB"
+
+        /** 把 GATT status 数字翻译成可读提示。 */
+        private fun gattStatus(status: Int): String =
+            if (status == BluetoothGatt.GATT_SUCCESS) "(SUCCESS)" else "(FAILED code=$status)"
     }
 }

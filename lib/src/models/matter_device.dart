@@ -76,6 +76,7 @@ class MatterDevice {
 enum MatterDeviceType {
   onOffLight('on_off_light', '灯'),
   dimmableLight('dimmable_light', '可调光灯'),
+  colorLight('color_light', '彩光灯'),
   onOffPlug('on_off_plug', '插座'),
   contactSensor('contact_sensor', '门窗传感器'),
   temperatureSensor('temperature_sensor', '温度传感器'),
@@ -98,8 +99,14 @@ enum MatterDeviceType {
 
   /// 该类型是否支持开关控制。
   bool get supportsOnOff =>
-      this == onOffLight || this == dimmableLight || this == onOffPlug;
+      this == onOffLight ||
+      this == dimmableLight ||
+      this == colorLight ||
+      this == onOffPlug;
 
   /// 该类型是否支持亮度调节。
-  bool get supportsBrightness => this == dimmableLight;
+  bool get supportsBrightness => this == dimmableLight || this == colorLight;
+
+  /// 该类型是否支持彩光/色温调节。
+  bool get supportsColor => this == colorLight;
 }
